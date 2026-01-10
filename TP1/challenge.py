@@ -14,52 +14,61 @@ class LaDisparition:
         self.model = model
         self.tokenizer = tokenizer
         # Here you want to pre-calculate forbidden token IDs
-        self.forbidden_ids = []
-        self.start_with_letter_ids = []
-        self.end_with_letter_ids = []
+        self.forbidden_ids_mask = torch.zeros(len(tokenizer.get_vocab()), dtype=torch.bool, device=model.device)
+        self.start_with_letter_mask = torch.zeros(len(tokenizer.get_vocab()), dtype=torch.bool, device=model.device)
+        self.end_with_letter_mask = torch.zeros(len(tokenizer.get_vocab()), dtype=torch.bool, device=model.device)
         for word,id in tokenizer.get_vocab().items():
             if 'e' in word or 'E' in word:
-                self.forbidden_ids.append(id)
-                # print(word,id)
+                self.forbidden_ids_mask[id] = True
             if word[0].isalpha():
-                self.start_with_letter_ids.append(id)
+                self.start_with_letter_mask[id] = True
             if word[-1].isalpha():
-                self.end_with_letter_ids.append(id)
+                self.end_with_letter_mask[id] = True
 
         # Warning: The evaluation server uses a different model and tokenizer than the template. Do not hard-code Token IDs. Use self.tokenizer.get_vocab() or self.tokenizer.encode() to find the IDs relevant to the current model.
 
+    @torch.no_grad()
     def __call__(self, prompt, max_tokens=30):
-        # Tokenize input prompt:
-        # input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-
-        # Generate tokens manually, one step at a time:
-        # (The bulk of the logic goes here)
-        # Hint: generating a single answer may not be enough!
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device).view(-1)
-        word_start_idx = None # The current word's first token idx in input_ids
-        word_start_alternatives = None # Alternative tokens to word start
+        device = self.model.device
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(device).view(-1)
+        word_start_state = {
+            'input_ids': None,
+            'past_key_values': None,
+            'alternatives': None
+        }
         prompt_length = input_ids.shape[0]
-
+        past_key_values = None
+        
         while input_ids.shape[0] < max_tokens + prompt_length:
-            generated = self.model(input_ids.view(1,-1))
-            next_token_id = torch.argmax(generated.logits[0][-1])
-            # Check if a new word has started ie there is no continuation
-            if not (next_token_id in self.start_with_letter_ids and input_ids[-1] in self.end_with_letter_ids):
-                word_start_idx = input_ids.shape[0]
-                word_start_alternatives = torch.argsort(generated.logits[0][-1], descending=True)
-            if next_token_id in self.forbidden_ids and word_start_idx is not None:
-                input_ids = input_ids[:word_start_idx]
-                i=1
-                while word_start_alternatives[i] in self.forbidden_ids:
-                    i += 1
-                word_start_alternatives = word_start_alternatives[i:]
-                next_token_id = word_start_alternatives[0]
-            input_ids = torch.cat((input_ids, next_token_id.view(-1)))
+            if past_key_values is None:
+                model_input = input_ids.view(1,-1)
+            else:
+                model_input = input_ids[-1:].view(1,-1)
+            
+            generated = self.model(model_input, past_key_values=past_key_values, use_cache=True)
 
-        generated = input_ids
-    
-        # Decode output tokens to string and return                   
-        return self.tokenizer.decode(generated, skip_special_tokens=True)
+            logits = generated.logits[0][-1]
+            logits.masked_fill_(self.forbidden_ids_mask, float('-inf'))
+            
+            next_token_id = torch.argmax(logits).item()
+
+            # Check if a new word has started ie there is no continuation
+            if not (self.start_with_letter_mask[next_token_id] and self.end_with_letter_mask[input_ids[-1]]):
+                word_start_state['input_ids'] = input_ids.clone()
+                word_start_state['past_key_values'] = past_key_values # Cache avant le mot
+                word_start_state['alternatives'] = torch.argsort(logits).tolist()
+            
+            # If the next token is forbidden, backtrack to word start and try next alternative
+            if self.forbidden_ids_mask[next_token_id] and word_start_state['input_ids'] is not None:
+                input_ids = word_start_state['input_ids']
+                past_key_values = word_start_state['past_key_values']
+                # Try next alternative (pop the highest probability one)
+                next_token_id = word_start_state['alternatives'].pop()
+            else:
+                input_ids = torch.cat((input_ids, torch.tensor([next_token_id], device=device)))
+                past_key_values = generated.past_key_values
+
+        return self.tokenizer.decode(input_ids, skip_special_tokens=True)
 
 
 # --- EXERCISE 2: The Toulouse Sequence ---

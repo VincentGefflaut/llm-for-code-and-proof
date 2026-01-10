@@ -86,18 +86,53 @@ class ToulouseSequence:
         # Here you want to pre-calculate forbidden token IDs
         # Hint:
         # print(tokenizer.encode("Toulouse", add_special_tokens=False))
+        self.forbidden_sequence = self.tokenizer.encode("Toulouse", add_special_tokens=False)
 
+    @torch.no_grad()
     def __call__(self, prompt, max_tokens=30):
-        # Tokenize input prompt:
-        # input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+        device = self.model.device
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(device).view(-1)
+        suspicious_start_state = {
+            'input_ids': None,
+            'past_key_values': None,
+            'alternatives': None,
+            'match_index': 0
+        }
+        prompt_length = input_ids.shape[0]
+        past_key_values = None
+        
+        while input_ids.shape[0] < max_tokens + prompt_length:
+            if past_key_values is None:
+                model_input = input_ids.view(1,-1)
+            else:
+                model_input = input_ids[-1:].view(1,-1)
+            
+            generated = self.model(model_input, past_key_values=past_key_values, use_cache=True)
 
-        # Generate tokens manually, one step at a time:
-        # (The bulk of the logic goes here)
-        # Hint: you need to track partial matches of the forbidden word
-    
-        # Decode output tokens to string and return                   
-        # return tokenizer.decode(generated, skip_special_tokens=True)
-        pass
+            logits = generated.logits[0][-1]
+            
+            next_token_id = torch.argmax(logits).item()
+
+            # Check if we're suspicious
+            if next_token_id == self.forbidden_sequence[suspicious_start_state['match_index']]:
+                suspicious_start_state['match_index'] += 1
+                if suspicious_start_state['match_index'] == 0:
+                    # Start of a new suspicious sequence
+                    suspicious_start_state['input_ids'] = input_ids.clone()
+                    suspicious_start_state['past_key_values'] = past_key_values # Cache avant le mot
+                    suspicious_start_state['alternatives'] = torch.argsort(logits).tolist()
+                elif suspicious_start_state['match_index'] == len(self.forbidden_sequence):
+                    # Full forbidden sequence matched
+                    suspicious_start_state['match_index'] = 0
+                    input_ids = suspicious_start_state['input_ids']
+                    past_key_values = suspicious_start_state['past_key_values']
+                    # Try next alternative (pop the highest probability one)
+                    next_token_id = suspicious_start_state['alternatives'].pop()
+            else:
+                input_ids = torch.cat((input_ids, torch.tensor([next_token_id], device=device)))
+                past_key_values = generated.past_key_values
+
+        return self.tokenizer.decode(input_ids, skip_special_tokens=True)
     
 if __name__ == "__main__":
     MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
